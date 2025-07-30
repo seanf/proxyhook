@@ -1,3 +1,5 @@
-# don't send any files to Docker build daemon, other than the fat jar
-*
+# don't send any build artifacts to Docker build daemon, other than the fat jar
+build
+out
+src
 !build/libs/*-fat.jar

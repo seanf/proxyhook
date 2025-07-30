@@ -1,5 +1,31 @@
 #!/usr/bin/env groovy
 
+
+/**
+ * Jenkinsfile for proxyhook server/client
+ *
+ * Environment variables:
+ *
+ * PROXYHOOK_DOCKER_REGISTRY - Docker registry host to use with OpenShift platform
+ * PROXYHOOK_OPENSHIFT - OpenShift platform URL
+ * PROXYHOOK_SERVER_PROJECT - OpenShift project name for DEV/QA/STAGE/PROD deployments
+ *
+ * For pull requests:
+ * - build and test
+ * - optional: wait for input
+ * - deploy to DEV
+ * - while (input = redeploy) deploy to DEV
+ * - wait for input
+ * - deploy to QA
+ * - while (input = redeploy) deploy to QA
+ *
+ * For master:
+ * - build and test
+ * - deploy to STAGE
+ * - wait for input
+ * - deploy to PROD
+ */
+
 @Field
 public static final String PROJ_BASE = 'github.com/zanata/proxyhook'
 
@@ -96,31 +122,7 @@ timestamps {
         stage('Build') {
           notify.startBuilding()
           tag = makeTag()
-
-          // TODO run detekt
-          sh """./gradlew clean build shadowJar jacocoTestReport
-          """
-
-          // archive build artifacts
-          archive "**/build/libs/*.jar"
-
-          // gather surefire results; mark build as unstable in case of failures
-          junit(testResults: '**/build/test-results/**/*.xml')
-          notify.testResults("UNIT", currentBuild.result)
-
-          if (isBuildResultSuccess()) {
-            // parse Jacoco test coverage
-            step([$class: 'JacocoPublisher'])
-
-            if (env.BRANCH_NAME == 'master') {
-              step([$class: 'MasterCoverageAction'])
-            } else if (env.BRANCH_NAME.startsWith('PR-')) {
-              step([$class: 'CompareCoverageAction'])
-            }
-
-            // send test coverage data to codecov.io
-            codecov(env, steps, mainScmGit)
-          }
+          buildAndTest()
         }
         stage('Deploy') {
           if (tag && isBuildResultSuccess()) {
@@ -171,6 +173,33 @@ timestamps {
         throw e
       }
     }
+  }
+}
+
+private void buildAndTest() {
+// TODO run detekt
+  sh """./gradlew clean build shadowJar jacocoTestReport
+  """
+
+  // archive build artifacts
+  archive "**/build/libs/*.jar"
+
+  // gather surefire results; mark build as unstable in case of failures
+  junit(testResults: '**/build/test-results/**/*.xml')
+  notify.testResults("UNIT", currentBuild.result)
+
+  if (isBuildResultSuccess()) {
+    // parse Jacoco test coverage
+    step([$class: 'JacocoPublisher'])
+
+    if (env.BRANCH_NAME == 'master') {
+      step([$class: 'MasterCoverageAction'])
+    } else if (env.BRANCH_NAME.startsWith('PR-')) {
+      step([$class: 'CompareCoverageAction'])
+    }
+
+    // send test coverage data to codecov.io
+    codecov(env, steps, mainScmGit)
   }
 }
 

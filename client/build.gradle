@@ -5,42 +5,28 @@ plugins {
 
 dependencies {
     compile project(':common')
+    compile 'com.xenomachina:kotlin-argparser:2.0.4'
+    compile "io.vertx:vertx-shell:$vertx_version"
     testCompile project(':server')
     testCompile 'org.jetbrains.kotlinx:kotlinx-coroutines-core:0.18'
     testCompile 'org.asynchttpclient:async-http-client:2.1.0-alpha20'
     testRuntime 'org.slf4j:slf4j-simple:1.7.25'
     testCompile 'org.mock-server:mockserver-netty:3.11'
+
+//    compile "io.vertx:vertx-hazelcast:$vertx_version"
+//    compile "io.vertx:vertx-infinispan:$vertx_version"
+//    // http://vertx.io/docs/vertx-infinispan/java/#_configuring_for_kubernetes_or_openshift_3
+//    compile 'org.infinispan:infinispan-cloud:9.1.2.Final'
+//    compile 'org.jgroups.kubernetes:jgroups-kubernetes:1.0.3.Final'
 }
 
-mainClassName = 'io.vertx.core.Launcher'
-def mainVerticleName = 'org.zanata.proxyhook.client.ProxyHookClient'
+mainClassName = 'org.zanata.proxyhook.client.ProxyHookClient'
 
 // enable debugger on a random port
 applicationDefaultJvmArgs = ['-Xdebug', '-Xrunjdwp:transport=dt_socket,address=0,server=y,suspend=n', '-Dsun.net.inetaddr.ttl=0', '-Dsun.net.inetaddr.negative.ttl=0']
 
-
-// Vert.x watches for file changes in all subdirectories
-// of src/ but only for files with .kt extension
-// NB this won't pick up changes in :common
-def watchForChange = 'src/**/*.kt'
-
-// Vert.x will call this task on changes
-def doOnChange = 'gradlew classes'
-
-//noinspection GroovyAssignabilityCheck
-run {
-    def urls = System.getProperty('urls') ?: ''
-    args = ['run', mainVerticleName] + urls.tokenize()
-    // redeploy doesn't stop the old code, for some reason
-//    args = ['run', mainVerticleName, "--redeploy=$watchForChange", "--launcher-class=$mainClassName", "--on-redeploy=$doOnChange"] + urls.tokenize()
-}
-
 shadowJar {
     classifier = 'fat'
-
-    manifest {
-        attributes "Main-Verticle": mainVerticleName
-    }
 
     mergeServiceFiles {
         include 'META-INF/services/io.vertx.core.spi.VerticleFactory'

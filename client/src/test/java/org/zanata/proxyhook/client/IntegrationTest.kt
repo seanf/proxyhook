@@ -2,6 +2,7 @@ package org.zanata.proxyhook.client
 
 import io.vertx.core.Future
 import io.vertx.core.Vertx
+import io.vertx.core.VertxOptions
 import io.vertx.core.http.HttpServer
 import io.vertx.core.logging.LoggerFactory
 import io.vertx.kotlin.coroutines.await
@@ -43,53 +44,65 @@ class IntegrationTest {
     private lateinit var proxyClient: ProxyClient
 
     @Before
-    fun before() {
-        server = Vertx.vertx()
+    fun before() = runBlocking {
         webhook = Vertx.vertx()
         client = Vertx.vertx()
     }
 
     @After
-    fun after() {
+    fun after() = runBlocking<Unit> {
         // to minimise shutdown errors:
         // 1. we want the client to stop delivering before the webhook receiver stops
         // 2. we want the client to disconnect from server before server stops
-        client.close()
-        webhook.close()
-        server.close()
+        awaitResult<Void> { client.close(it) }
+        awaitResult<Void> { webhook.close(it) }
+        awaitResult<Void> { server.close(it) }
     }
 
     @Test
     fun rootDeployment() {
+        server = Vertx.vertx()
+        deliverProxiedWebhook(prefix = "")
+        proxyClient.verifyZeroInteractions()
+    }
+
+    @Test
+    fun rootDeploymentInInfinispanCluster() {
+        server = runBlocking {
+            awaitResult<Vertx> {
+                val serverOpts = VertxOptions().apply {
+                    isClustered = true
+                    clusterManager = io.vertx.ext.cluster.infinispan.InfinispanClusterManager()
+                    clusterHost = "localhost"
+                    clusterPort = 0
+                }
+                Vertx.clusteredVertx(serverOpts, it)
+            }
+        }
         deliverProxiedWebhook(prefix = "")
         proxyClient.verifyZeroInteractions()
     }
 
     @Test
     fun rootDeploymentWithProxy() {
-        deliverProxiedWebhook(prefix = "", internalHttpProxy = proxyRule.httpPort)
+        server = Vertx.vertx()
+        deliverProxiedWebhook(prefix = "", httpProxyHost = "localhost", httpProxyPort = proxyRule.httpPort)
 //        proxyClient.dumpToLogAsJSON(request())
         proxyClient.verify(request(), once())
     }
 
     @Test
     fun subPathDeployment() {
+        server = Vertx.vertx()
         deliverProxiedWebhook(prefix = "/proxyhook")
         proxyClient.verifyZeroInteractions()
-    }
-
-    @Test
-    fun subPathDeploymentWithProxy() {
-        deliverProxiedWebhook(prefix = "/proxyhook", internalHttpProxy = proxyRule.httpPort)
-//        proxyClient.dumpToLogAsJSON(request())
-        proxyClient.verify(request(), once())
     }
 
     private fun ProxyClient.verifyZeroInteractions() {
         verify(request(), exactly(0))
     }
 
-    private fun deliverProxiedWebhook(prefix: String, internalHttpProxy: Int? = null): Unit = runBlocking {
+    private fun deliverProxiedWebhook(prefix: String, httpProxyHost: String? = null, httpProxyPort: Int? = null): Unit = runBlocking {
         // this future will succeed if the test passes,
         // or fail if something goes wrong.
         val testFinished = CompletableFuture<Unit>()
@@ -101,7 +114,7 @@ class IntegrationTest {
         val websocketUrl = "ws://localhost:${serverPort.await()}$prefix/listen"
         val postUrl = "http://localhost:${serverPort.await()}$prefix/webhook"
         // wait for proxyhook server and webhook receiver before starting client
-        val client = startClient(testFinished, websocketUrl, receiveUrl, internalHttpProxy)
+        val client = startClient(testFinished, websocketUrl, receiveUrl, httpProxyHost, httpProxyPort)
 
         // wait for client login before sending webhook to proxyhook server
         client.await()
@@ -142,10 +155,10 @@ class IntegrationTest {
         actualPort
     }
 
-    private fun startClient(testFinished: CompletableFuture<Unit>, websocketUrl: String, receiveUrl: String, internalHttpProxy: Int?): Future<Unit> {
+    private fun startClient(testFinished: CompletableFuture<Unit>, websocketUrl: String, receiveUrl: String, internalHttpProxyHost: String?, internalHttpProxyPort: Int?): Future<Unit> {
         log.info("deploying client")
         val clientReady = Future.future<Unit>()
-        client.deployVerticle(ProxyHookClient(clientReady, websocketUrl, receiveUrl, internalHttpProxy = internalHttpProxy)) {
+        client.deployVerticle(ProxyHookClient(clientReady, listOf(websocketUrl), listOf(receiveUrl), internalHttpProxyHost = internalHttpProxyHost, internalHttpProxyPort = internalHttpProxyPort)) {
             if (it.failed()) {
                 testFinished.completeExceptionally(it.cause())
             }

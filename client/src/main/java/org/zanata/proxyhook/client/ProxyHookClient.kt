@@ -20,8 +20,12 @@
  */
 package org.zanata.proxyhook.client
 
+import com.xenomachina.argparser.ArgParser
+import com.xenomachina.argparser.DefaultHelpFormatter
+import com.xenomachina.argparser.mainBody
 import io.netty.buffer.Unpooled
 import io.vertx.core.AbstractVerticle
+import io.vertx.core.CompositeFuture
 import io.vertx.core.Future
 import io.vertx.core.MultiMap
 import io.vertx.core.Vertx
@@ -32,12 +36,12 @@ import io.vertx.core.http.HttpClientResponse
 import io.vertx.core.http.WebSocket
 import io.vertx.core.http.impl.FrameType
 import io.vertx.core.http.impl.ws.WebSocketFrameImpl
+import io.vertx.core.json.DecodeException
 import io.vertx.core.json.JsonObject
 import io.vertx.core.logging.LoggerFactory
 import io.vertx.core.net.ProxyOptions
 import org.zanata.proxyhook.common.Constants.EVENT_ID_HEADERS
 import org.zanata.proxyhook.common.Constants.MAX_FRAME_SIZE
-import org.zanata.proxyhook.common.Constants.PATH_WEBSOCKET
 import org.zanata.proxyhook.common.Constants.PROXYHOOK_PASSWORD
 import org.zanata.proxyhook.common.Keys.BUFFER
 import org.zanata.proxyhook.common.Keys.BUFFER_TEXT
@@ -65,11 +69,22 @@ import java.net.UnknownHostException
  * @param ready optional Future which will complete when deployment is complete.
  * @author Sean Flanigan [sflaniga@redhat.com](mailto:sflaniga@redhat.com)
  */
-class ProxyHookClient(var ready: Future<Unit>? = null, var args: List<String>? = null, val internalHttpProxy: Int? = null) : AbstractVerticle() {
-    constructor(ready: Future<Unit>?, vararg args: String, internalHttpProxy: Int? = null) : this(ready, args.asList(), internalHttpProxy)
+// TODO add http proxy
+class ProxyHookClient(
+        val ready: Future<Unit>? = null,
+        val webSocketUrls: List<String>,
+        val webhookUrls: List<String>,
+        val internalHttpProxyHost: String? = null,
+        val internalHttpProxyPort: Int? = null) : AbstractVerticle() {
+
+    init {
+        if (webSocketUrls.isEmpty() || webhookUrls.isEmpty()) {
+            throw StartupException("Must provide at least one websocket and at least one webhook")
+        }
+    }
 
     companion object {
-        private val APP_NAME = ProxyHookClient::class.java.name
+        private val APP_NAME = ProxyHookClient::class.java.simpleName
         private val log = LoggerFactory.getLogger(ProxyHookClient::class.java)
 
         private val sslInsecureServer: Boolean by lazy {
@@ -131,9 +146,27 @@ class ProxyHookClient(var ready: Future<Unit>? = null, var args: List<String>? =
                 // deliberately not included: Connection, Host, Origin, If-*, Cache-Control, Proxy-Authorization, Range, Upgrade
                 .map { it.toLowerCase() }
 
-        @JvmStatic fun main(args: Array<String>) {
-            // TODO add http proxy
-            Vertx.vertx().deployVerticle(ProxyHookClient(ready = null, args = args.toList()), { result ->
+        /**
+         * Main method, used to launch proxyhook client with CLI arguments
+         */
+        @JvmStatic fun main(args: Array<String>) = mainBody(APP_NAME) {
+            class MyArgs (parser: ArgParser) {
+                val webSocketUrls: List<String> by parser.adding("-s", "--websocket", help = "connect to websocket (proxyhook server), eg wss://proxyhook.example.com/");
+                val webhookUrls: List<String> by parser.adding("-k", "--webhook", help = "deliver webhooks to web server, eg http://target1.example.com/webhook")
+            }
+
+            val helpFormatter = DefaultHelpFormatter(
+                    prologue = "ProxyHookClient connects to a ProxyHook server, receives proxied webhooks over a websocket, then forwards them to a specified web server",
+                    epilogue = "Note that at least one WEBSOCKET and at least one WEBHOOK must be provided.")
+            val argParser = ArgParser(
+                    args = if (args.isEmpty()) arrayOf("--help") else args,
+                    helpFormatter = helpFormatter)
+            val opts = argParser.parseInto(::MyArgs)
+
+            if (opts.webSocketUrls.isEmpty()) throw StartupException("Must specify at least one websocket")
+            if (opts.webhookUrls.isEmpty()) throw StartupException("Must specify at least one webhook")
+
+            Vertx.vertx().deployVerticle(ProxyHookClient(ready = null, webSocketUrls = opts.webSocketUrls, webhookUrls = opts.webhookUrls), { result ->
                 result.otherwise { e ->
                     exit(e)
                 }
@@ -141,79 +174,65 @@ class ProxyHookClient(var ready: Future<Unit>? = null, var args: List<String>? =
         }
     }
 
-    // TODO use http://vertx.io/docs/vertx-core/java/#_vert_x_command_line_interface_api
-    // not this mess.
-    // Command line is of the pattern "vertx run [options] main-verticle [verticle_args...]"
-    // so strip off everything up to the Verticle class name.
-    private fun findArgs(): List<String> {
-        args?.let { return it }
-        val processArgs = vertx.orCreateContext.processArgs() ?: listOf()
-        log.debug("processArgs: " + processArgs)
-        val n = processArgs.indexOf(javaClass.name)
-        val argsAfterClass = processArgs.subList(n + 1, processArgs.size)
-        val result = argsAfterClass.filter { arg -> !arg.startsWith("-") }
-        log.debug("args: " + result)
-        args = result
-        return result
-    }
-
     override fun start(startFuture: Future<Void>) {
-        val args = findArgs()
-        if (args.size < 2) {
-            throw StartupException("Usage: wss://proxyhook.example.com/$PATH_WEBSOCKET http://target1.example.com/webhook [http://target2.example.com/webhook ...]")
-        }
-        startClient(args[0], args.subList(1, args.size), startFuture)
+        startClient(startFuture)
     }
 
-    private fun startClient(webSocketUrl: String, webhookUrls: List<String>, startFuture: Future<Void>) {
-        log.info("starting client for websocket: $webSocketUrl posting to webhook URLs: $webhookUrls")
+    private fun startClient(startFuture: Future<Void>) {
+        log.info("starting client for websockets: $webSocketUrls posting to webhook URLs: $webhookUrls")
+        log.info("Using internal http proxy: $internalHttpProxyHost:$internalHttpProxyPort")
 
         webhookUrls.forEach { this.checkURI(it) }
+        val wsUris = webSocketUrls.map { parseUri(it) }
 
-        val wsUri = parseUri(webSocketUrl)
-        val webSocketRelativeUri = getRelativeUri(wsUri)
-        val useSSL = getSSL(wsUri)
-        val wsOptions = HttpClientOptions().apply {
-            // 60s timeout based on pings from every 50s (both directions)
-            idleTimeout = 60
-            connectTimeout = 10_000
-            defaultHost = wsUri.host
-            defaultPort = getWebsocketPort(wsUri)
-            maxWebsocketFrameSize = MAX_FRAME_SIZE
-            isSsl = useSSL
-            isVerifyHost = !sslInsecureServer
-            isTrustAll = sslInsecureServer
-            // this doesn't appear to affect websocket connections
+        CompositeFuture.all(wsUris.map { wsUri ->
+            val future = Future.future<Void>()
+            val webSocketRelativeUri = getRelativeUri(wsUri)
+            val useSSL = getSSL(wsUri)
+            val wsOptions = HttpClientOptions().apply {
+                // 60s timeout based on pings from every 50s (both directions)
+                idleTimeout = 60
+                connectTimeout = 10_000
+                defaultHost = wsUri.host
+                defaultPort = getWebsocketPort(wsUri)
+                maxWebsocketFrameSize = MAX_FRAME_SIZE
+                isSsl = useSSL
+                isVerifyHost = !sslInsecureServer
+                isTrustAll = sslInsecureServer
+                // this doesn't appear to affect websocket connections
 //            externalHttpProxy?.let { portNum ->
 //                proxyOptions = ProxyOptions().apply {
 //                    host = "localhost"
 //                    port = portNum
 //                }
 //            }
-        }
-        val wsClient = vertx.createHttpClient(wsOptions)
-        val httpOptions = HttpClientOptions().apply {
-            isVerifyHost = !sslInsecureDelivery
-            isTrustAll = sslInsecureDelivery
-            internalHttpProxy?.let { portNum ->
-                proxyOptions = ProxyOptions().apply {
-                    host = "localhost"
-                    port = portNum
+            }
+            val wsClient = vertx.createHttpClient(wsOptions)
+            val httpOptions = HttpClientOptions().apply {
+                isVerifyHost = !sslInsecureDelivery
+                isTrustAll = sslInsecureDelivery
+                internalHttpProxyPort?.let { portNum ->
+                    proxyOptions = ProxyOptions().apply {
+                        host = "localhost"
+                        port = portNum
+                    }
                 }
             }
-        }
-        val httpClient = vertx.createHttpClient(httpOptions)
+            val httpClient = vertx.createHttpClient(httpOptions)
 
-        connect(webhookUrls, webSocketRelativeUri, wsClient, httpClient, startFuture)
+            connect(webSocketRelativeUri, wsClient, httpClient, future)
+            future
+        }).setHandler { res -> if (res.succeeded()) startFuture.complete() else startFuture.fail(res.cause()) }
+            // TODO this would be better, but so far I can't get the types right without casting
+//        }).setHandler(startFuture.completer() as Handler<AsyncResult<CompositeFuture>>)
     }
 
-    private fun connect(webhookUrls: List<String>,
-                        webSocketRelativeUri: String, wsClient: HttpClient,
-                        httpClient: HttpClient, startFuture: Future<Void>? = null) {
+    private fun connect(webSocketRelativeUri: String, wsClient: HttpClient,
+                        httpClient: HttpClient, wsFuture: Future<*>? = null) {
         wsClient.websocket(webSocketRelativeUri, { webSocket ->
             var password: String? = getenv(PROXYHOOK_PASSWORD)
             if (password == null) password = ""
-            log.info("trying to log in")
+            log.info("trying to log in to ${webSocket.remoteAddress()}")
             val login = JsonObject()
             login.put(TYPE, LOGIN)
             login.put(PASSWORD, password)
@@ -229,55 +248,58 @@ class ProxyHookClient(var ready: Future<Unit>? = null, var args: List<String>? =
                 sendPingFrame(webSocket)
             }
             webSocket.handler { buf: Buffer ->
-                handleWebSocket(webhookUrls, buf, webSocket, wsClient, httpClient, startFuture)
+                handleWebSocket(buf, webSocket, wsClient, httpClient, wsFuture)
             }
             webSocket.closeHandler {
                 log.info("websocket closed")
                 vertx.cancelTimer(periodicTimer)
                 vertx.setTimer(300) {
-                    connect(webhookUrls,
-                            webSocketRelativeUri, wsClient, httpClient)
+                    connect(webSocketRelativeUri, wsClient, httpClient)
                 }
             }
             webSocket.exceptionHandler { e ->
                 log.error("websocket stream exception", e)
                 vertx.cancelTimer(periodicTimer)
                 vertx.setTimer(2000) {
-                    connect(webhookUrls,
-                            webSocketRelativeUri, wsClient, httpClient)
+                    connect(webSocketRelativeUri, wsClient, httpClient)
                 }
             }
         }) { e ->
             log.error("websocket connection exception", e)
             vertx.setTimer(2000) {
-                connect(webhookUrls,
-                        webSocketRelativeUri, wsClient, httpClient)
+                connect(webSocketRelativeUri, wsClient, httpClient)
             }
         }
     }
 
     // TODO too many params
-    private fun handleWebSocket(webhookUrls: List<String>, buf: Buffer, webSocket: WebSocket, wsClient: HttpClient, httpClient: HttpClient, startFuture: Future<Void>?) {
-        val msg = buf.toJsonObject()
+    private fun handleWebSocket(buf: Buffer, webSocket: WebSocket, wsClient: HttpClient, httpClient: HttpClient, startFuture: Future<*>?) {
+        val msg: JsonObject
+        try {
+            msg = buf.toJsonObject()
+        } catch (e: DecodeException) {
+            log.warn("Invalid JSON from ${webSocket.remoteAddress()}: \n${buf.bytes.joinToString()}")
+            return
+        }
         log.debug("payload: {0}", msg)
 
         val type = msg.getString(TYPE)
         val messageType = MessageType.valueOf(type)
         when (messageType) {
             MessageType.SUCCESS -> {
-                log.info("logged in")
+                log.info("logged in to ${webSocket.remoteAddress()}")
                 ready?.complete()
                 startFuture?.complete()
             }
             MessageType.FAILED -> {
                 webSocket.close()
                 wsClient.close()
-                startFuture?.fail("login failed")
+                startFuture?.fail("login failed for ${webSocket.remoteAddress()}")
             }
             MessageType.WEBHOOK -> handleWebhook(webhookUrls, httpClient, msg)
             MessageType.PING -> {
                 val pingId = msg.getString(PING_ID)
-                log.debug("received PING with id {}", pingId)
+                log.debug("received PING with id {} from ${webSocket.remoteAddress()}", pingId)
                 val pong = JsonObject()
                 pong.put(TYPE, PONG)
                 pong.put(PING_ID, pingId)
@@ -286,14 +308,14 @@ class ProxyHookClient(var ready: Future<Unit>? = null, var args: List<String>? =
             PONG -> {
                 val pongId = msg.getString(PING_ID)
                 // TODO check ping ID
-                log.debug("received PONG with id {}", pongId)
+                log.debug("received PONG with id {} from ${webSocket.remoteAddress()}", pongId)
             }
             else -> {
                 // TODO this might happen if the server is newer than the client
                 // should we log a warning and keep going, to be more robust?
                 webSocket.close()
                 wsClient.close()
-                startFuture?.fail("unexpected message type: " + type)
+                startFuture?.fail("unexpected message type: $type from ${webSocket.remoteAddress()}")
             }
         }
     }
@@ -397,7 +419,7 @@ class ProxyHookClient(var ready: Future<Unit>? = null, var args: List<String>? =
         try {
             return URI(uri)
         } catch (e: URISyntaxException) {
-            throw StartupException("Invalid URI: " + uri)
+            throw StartupException("Invalid URI: $uri")
         }
     }
 
